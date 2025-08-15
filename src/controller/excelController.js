@@ -14,37 +14,83 @@ const Brand = require("../model/brand.Schema");
 
 const excelController = express.Router();
 
-const uploadLocalImage = async (filePath, folder) => {
-  console.log("file path: ", filePath);
-  console.log("Folder", folder);
+const isHttpUrl = (s) => typeof s === "string" && /^https?:\/\//i.test(s);
+const isDataUri = (s) => typeof s === "string" && s.startsWith("data:");
+
+// const uploadLocalImage = async (filePath, folder) => {
+//   console.log("file path: ", filePath);
+//   console.log("Folder", folder);
+//   try {
+//     // Ensure path is valid for server
+//     if (!fs.existsSync(filePath)) {
+//       console.error("File not found:", filePath);
+//       return "";
+//     }
+
+//     // Read file as base64
+//     const fileData = fs.readFileSync(filePath, { encoding: "base64" });
+
+//     console.log("File Data", fileData);
+
+//     // Guess extension (default jpeg if unknown)
+//     const ext = path.extname(filePath).replace(".", "") || "jpeg";
+
+//     console.log("extension:", ext);
+
+//     // Convert to Data URI
+//     const dataURI = `data:image/${ext};base64,${fileData}`;
+
+//     console.log("data", dataURI);
+
+//     // Upload to Cloudinary
+//     const uploadRes = await cloudinary.uploader.upload(dataURI, { folder });
+//     console.log("upload",uploadRes);
+//     return uploadRes.secure_url;
+//   } catch (err) {
+//     console.error(`Image upload error for ${filePath}:`, err);
+//     return "";
+//   }
+// };
+
+// Convert string to ObjectId safely
+// const toObjectId = (id) => {
+//   try {
+//     return mongoose.Types.ObjectId(id.trim());
+//   } catch {
+//     return null;
+//   }
+// };
+
+// Normalize each row before insert
+
+
+const uploadImage = async (input, folder) => {
   try {
-    // Ensure path is valid for server
-    if (!fs.existsSync(filePath)) {
-      console.error("File not found:", filePath);
-      return "";
+    if (!input || typeof input !== "string") return "";
+
+    if (isHttpUrl(input) || isDataUri(input)) {
+      const res = await cloudinary.uploader.upload(input, { folder });
+      return res.secure_url;
     }
 
-    // Read file as base64
-    const fileData = fs.readFileSync(filePath, { encoding: "base64" });
+    // Optional: allow relative paths that exist on the server bundle (rare)
+    // CAUTION: In serverless environments, only files bundled or in /tmp exist.
+    // If you want to support relative paths during local dev only:
+    if (!path.isAbsolute(input)) {
+      const abs = path.join(process.cwd(), input);
+      if (fs.existsSync(abs)) {
+        const ext = path.extname(abs).replace(".", "") || "jpeg";
+        const fileData = fs.readFileSync(abs, { encoding: "base64" });
+        const dataURI = `data:image/${ext};base64,${fileData}`;
+        const res = await cloudinary.uploader.upload(dataURI, { folder });
+        return res.secure_url;
+      }
+    }
 
-    console.log("File Data", fileData);
-
-    // Guess extension (default jpeg if unknown)
-    const ext = path.extname(filePath).replace(".", "") || "jpeg";
-
-    console.log("extension:", ext);
-
-    // Convert to Data URI
-    const dataURI = `data:image/${ext};base64,${fileData}`;
-
-    console.log("data", dataURI);
-
-    // Upload to Cloudinary
-    const uploadRes = await cloudinary.uploader.upload(dataURI, { folder });
-    console.log("upload",uploadRes);
-    return uploadRes.secure_url;
+    console.error("Unsupported path in serverless (use URL or data URI):", input);
+    return "";
   } catch (err) {
-    console.error(`Image upload error for ${filePath}:`, err);
+    console.error("Cloudinary upload error:", err);
     return "";
   }
 };
@@ -58,13 +104,13 @@ const toObjectId = (id) => {
   }
 };
 
-// Normalize each row before insert
+// Normalize each row before insert/update
 const normalizeProductData = async (item) => {
-  // CATEGORY: Convert category name to ID
+  // CATEGORY: Convert category name to IDs
   if (item.category && typeof item.category === "string") {
-    const categoryNames = item.category.split(",").map(name => name.trim());
+    const categoryNames = item.category.split(",").map((name) => name.trim());
     const categoryDocs = await Category.find({ name: { $in: categoryNames } });
-    item.categoryId = categoryDocs.map(cat => cat._id);
+    item.categoryId = categoryDocs.map((cat) => cat._id);
   }
 
   // BRAND: Convert brand name to ID
@@ -73,59 +119,46 @@ const normalizeProductData = async (item) => {
     item.brandId = brandDoc ? brandDoc._id : null;
   }
 
-  // PRODUCT HERO IMAGE: Upload from local path if provided
-  // if (item.productHeroImage && typeof item.productHeroImage === "string") {
-  //   try {
-  //     const uploadRes = await cloudinary.uploader.upload(item.productHeroImage, {
-  //       folder: "products",
-  //     });
-  //     console.log("uploade url: ", uploadRes.secure_url)
-  //     item.productHeroImage = uploadRes.secure_url;
-  //   } catch (err) {
-  //     console.error("Hero Image Upload Error:", err);
-  //     item.productHeroImage = "";
-  //   }
-  // } else {
-  //   item.productHeroImage = "";
-  // }
-
+  // PRODUCT HERO IMAGE
   if (item.productHeroImage && typeof item.productHeroImage === "string") {
-    item.productHeroImage = await uploadLocalImage(item.productHeroImage, "products");
+    item.productHeroImage = await uploadImage(item.productHeroImage, "products");
   } else {
     item.productHeroImage = "";
   }
 
-  // PRODUCT GALLERY: Upload each local path
+  // PRODUCT GALLERY
   if (item.productGallery && typeof item.productGallery === "string") {
-    const galleryPaths = item.productGallery.split(",").map(url => url.trim());
-    const uploadedGallery = [];
+    const galleryInputs = item.productGallery
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
 
-    for (const imgPath of galleryPaths) {
+    const uploadedGallery = [];
+    for (const src of galleryInputs) {
       try {
-        const uploadRes = await cloudinary.uploader.upload(imgPath, {
-          folder: "products/gallery",
-        });
-        uploadedGallery.push(uploadRes.secure_url);
+        const url = await uploadImage(src, "products/gallery");
+        if (url) uploadedGallery.push(url);
       } catch (err) {
         console.error("Gallery Image Upload Error:", err);
       }
     }
-
     item.productGallery = uploadedGallery;
   } else {
     item.productGallery = [];
   }
 
-  // TAGS: Parse comma separated tags
+  // TAGS
   if (item.tags && typeof item.tags === "string") {
-    item.tags = item.tags.split(",").map(tag => tag.trim());
+    item.tags = item.tags.split(",").map((tag) => tag.trim());
   } else {
     item.tags = [];
   }
 
-  // SPECIAL APPEARANCE: Parse comma separated values
+  // SPECIAL APPEARANCE
   if (item.specialAppearance && typeof item.specialAppearance === "string") {
-    item.specialAppearance = item.specialAppearance.split(",").map(s => s.trim());
+    item.specialAppearance = item.specialAppearance
+      .split(",")
+      .map((s) => s.trim());
   } else {
     item.specialAppearance = [];
   }
@@ -135,7 +168,7 @@ const normalizeProductData = async (item) => {
   delete item.productOtherDetails;
   delete item.productVariants;
   delete item.category; // remove the category name field used for mapping
-  delete item.brand;    // remove the brand name field used for mapping
+  delete item.brand; // remove the brand name field used for mapping
 
   return item;
 };
@@ -154,7 +187,12 @@ excelController.post("/upload-or-update", upload.single("file"), async (req, res
     const sheetName = workbook.SheetNames[0];
     const jsonData = xlsx.utils.sheet_to_json(workbook.Sheets[sheetName]);
 
-    fs.unlinkSync(filePath); // Clean up temp file
+    // Clean up temp file (multer disk storage)
+    try {
+      fs.unlinkSync(filePath);
+    } catch (e) {
+      console.warn("Failed to remove temp file:", e?.message);
+    }
 
     if (!jsonData || jsonData.length === 0) {
       return sendResponse(res, 422, "Failed", {
@@ -163,31 +201,22 @@ excelController.post("/upload-or-update", upload.single("file"), async (req, res
       });
     }
 
-    let insertedProducts = [];
-    let updatedProducts = [];
+    const insertedProducts = [];
+    const updatedProducts = [];
 
-    for (const item of jsonData.filter(i => i.name && i.price)) {
-      // Normalize data
+    for (const item of jsonData.filter((i) => i.name && i.price)) {
       const normalizedItem = await normalizeProductData({ ...item });
 
-      // Check if product exists by name
       const existingProduct = await Product.findOne({ name: item.name.trim() });
-
       if (existingProduct) {
-        // Update product
-        await Product.updateOne(
-          { _id: existingProduct._id },
-          { $set: normalizedItem }
-        );
+        await Product.updateOne({ _id: existingProduct._id }, { $set: normalizedItem });
         updatedProducts.push(existingProduct.name);
       } else {
-        // Insert new product
         const newProduct = await Product.create(normalizedItem);
         insertedProducts.push(newProduct.name);
       }
     }
 
-    // Dynamic message
     let message = "";
     if (insertedProducts.length > 0 && updatedProducts.length > 0) {
       message = "Products uploaded and updated successfully!";
@@ -207,7 +236,6 @@ excelController.post("/upload-or-update", upload.single("file"), async (req, res
       updated: updatedProducts,
       statusCode: 200,
     });
-
   } catch (error) {
     console.error("Excel Upload/Update Error:", error);
     const statusCode = error.statusCode || 500;
@@ -217,6 +245,165 @@ excelController.post("/upload-or-update", upload.single("file"), async (req, res
     });
   }
 });
+
+// const normalizeProductData = async (item) => {
+//   // CATEGORY: Convert category name to ID
+//   if (item.category && typeof item.category === "string") {
+//     const categoryNames = item.category.split(",").map(name => name.trim());
+//     const categoryDocs = await Category.find({ name: { $in: categoryNames } });
+//     item.categoryId = categoryDocs.map(cat => cat._id);
+//   }
+
+//   // BRAND: Convert brand name to ID
+//   if (item.brand && typeof item.brand === "string") {
+//     const brandDoc = await Brand.findOne({ name: item.brand.trim() });
+//     item.brandId = brandDoc ? brandDoc._id : null;
+//   }
+
+//   // PRODUCT HERO IMAGE: Upload from local path if provided
+//   // if (item.productHeroImage && typeof item.productHeroImage === "string") {
+//   //   try {
+//   //     const uploadRes = await cloudinary.uploader.upload(item.productHeroImage, {
+//   //       folder: "products",
+//   //     });
+//   //     console.log("uploade url: ", uploadRes.secure_url)
+//   //     item.productHeroImage = uploadRes.secure_url;
+//   //   } catch (err) {
+//   //     console.error("Hero Image Upload Error:", err);
+//   //     item.productHeroImage = "";
+//   //   }
+//   // } else {
+//   //   item.productHeroImage = "";
+//   // }
+
+//   if (item.productHeroImage && typeof item.productHeroImage === "string") {
+//     item.productHeroImage = await uploadLocalImage(item.productHeroImage, "products");
+//   } else {
+//     item.productHeroImage = "";
+//   }
+
+//   // PRODUCT GALLERY: Upload each local path
+//   if (item.productGallery && typeof item.productGallery === "string") {
+//     const galleryPaths = item.productGallery.split(",").map(url => url.trim());
+//     const uploadedGallery = [];
+
+//     for (const imgPath of galleryPaths) {
+//       try {
+//         const uploadRes = await cloudinary.uploader.upload(imgPath, {
+//           folder: "products/gallery",
+//         });
+//         uploadedGallery.push(uploadRes.secure_url);
+//       } catch (err) {
+//         console.error("Gallery Image Upload Error:", err);
+//       }
+//     }
+
+//     item.productGallery = uploadedGallery;
+//   } else {
+//     item.productGallery = [];
+//   }
+
+//   // TAGS: Parse comma separated tags
+//   if (item.tags && typeof item.tags === "string") {
+//     item.tags = item.tags.split(",").map(tag => tag.trim());
+//   } else {
+//     item.tags = [];
+//   }
+
+//   // SPECIAL APPEARANCE: Parse comma separated values
+//   if (item.specialAppearance && typeof item.specialAppearance === "string") {
+//     item.specialAppearance = item.specialAppearance.split(",").map(s => s.trim());
+//   } else {
+//     item.specialAppearance = [];
+//   }
+
+//   // Clean up unnecessary fields
+//   delete item.venderId;
+//   delete item.productOtherDetails;
+//   delete item.productVariants;
+//   delete item.category; // remove the category name field used for mapping
+//   delete item.brand;    // remove the brand name field used for mapping
+
+//   return item;
+// };
+
+// excelController.post("/upload-or-update", upload.single("file"), async (req, res) => {
+//   try {
+//     if (!req.file) {
+//       return sendResponse(res, 400, "Failed", {
+//         message: "No file uploaded",
+//         statusCode: 400,
+//       });
+//     }
+
+//     const filePath = req.file.path;
+//     const workbook = xlsx.readFile(filePath);
+//     const sheetName = workbook.SheetNames[0];
+//     const jsonData = xlsx.utils.sheet_to_json(workbook.Sheets[sheetName]);
+
+//     fs.unlinkSync(filePath); // Clean up temp file
+
+//     if (!jsonData || jsonData.length === 0) {
+//       return sendResponse(res, 422, "Failed", {
+//         message: "Excel file is empty or invalid",
+//         statusCode: 422,
+//       });
+//     }
+
+//     let insertedProducts = [];
+//     let updatedProducts = [];
+
+//     for (const item of jsonData.filter(i => i.name && i.price)) {
+//       // Normalize data
+//       const normalizedItem = await normalizeProductData({ ...item });
+
+//       // Check if product exists by name
+//       const existingProduct = await Product.findOne({ name: item.name.trim() });
+
+//       if (existingProduct) {
+//         // Update product
+//         await Product.updateOne(
+//           { _id: existingProduct._id },
+//           { $set: normalizedItem }
+//         );
+//         updatedProducts.push(existingProduct.name);
+//       } else {
+//         // Insert new product
+//         const newProduct = await Product.create(normalizedItem);
+//         insertedProducts.push(newProduct.name);
+//       }
+//     }
+
+//     // Dynamic message
+//     let message = "";
+//     if (insertedProducts.length > 0 && updatedProducts.length > 0) {
+//       message = "Products uploaded and updated successfully!";
+//     } else if (insertedProducts.length > 0) {
+//       message = "Products uploaded successfully!";
+//     } else if (updatedProducts.length > 0) {
+//       message = "Products updated successfully!";
+//     } else {
+//       message = "No products were uploaded or updated.";
+//     }
+
+//     return sendResponse(res, 200, "Success", {
+//       message,
+//       insertedCount: insertedProducts.length,
+//       inserted: insertedProducts,
+//       updatedCount: updatedProducts.length,
+//       updated: updatedProducts,
+//       statusCode: 200,
+//     });
+
+//   } catch (error) {
+//     console.error("Excel Upload/Update Error:", error);
+//     const statusCode = error.statusCode || 500;
+//     return sendResponse(res, statusCode, "Failed", {
+//       message: error.message || "Internal Server Error",
+//       statusCode,
+//     });
+//   }
+// });
 
 
 
