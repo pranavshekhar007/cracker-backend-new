@@ -14,6 +14,32 @@ const Brand = require("../model/brand.Schema");
 
 const excelController = express.Router();
 
+const uploadLocalImage = async (filePath, folder) => {
+  try {
+    // Ensure path is valid for server
+    if (!fs.existsSync(filePath)) {
+      console.error("File not found:", filePath);
+      return "";
+    }
+
+    // Read file as base64
+    const fileData = fs.readFileSync(filePath, { encoding: "base64" });
+
+    // Guess extension (default jpeg if unknown)
+    const ext = path.extname(filePath).replace(".", "") || "jpeg";
+
+    // Convert to Data URI
+    const dataURI = `data:image/${ext};base64,${fileData}`;
+
+    // Upload to Cloudinary
+    const uploadRes = await cloudinary.uploader.upload(dataURI, { folder });
+    return uploadRes.secure_url;
+  } catch (err) {
+    console.error(`Image upload error for ${filePath}:`, err);
+    return "";
+  }
+};
+
 // Convert string to ObjectId safely
 const toObjectId = (id) => {
   try {
@@ -39,16 +65,23 @@ const normalizeProductData = async (item) => {
   }
 
   // PRODUCT HERO IMAGE: Upload from local path if provided
+  // if (item.productHeroImage && typeof item.productHeroImage === "string") {
+  //   try {
+  //     const uploadRes = await cloudinary.uploader.upload(item.productHeroImage, {
+  //       folder: "products",
+  //     });
+  //     console.log("uploade url: ", uploadRes.secure_url)
+  //     item.productHeroImage = uploadRes.secure_url;
+  //   } catch (err) {
+  //     console.error("Hero Image Upload Error:", err);
+  //     item.productHeroImage = "";
+  //   }
+  // } else {
+  //   item.productHeroImage = "";
+  // }
+
   if (item.productHeroImage && typeof item.productHeroImage === "string") {
-    try {
-      const uploadRes = await cloudinary.uploader.upload(item.productHeroImage, {
-        folder: "products",
-      });
-      item.productHeroImage = uploadRes.secure_url;
-    } catch (err) {
-      console.error("Hero Image Upload Error:", err);
-      item.productHeroImage = "";
-    }
+    item.productHeroImage = await uploadLocalImage(item.productHeroImage, "products");
   } else {
     item.productHeroImage = "";
   }
@@ -98,7 +131,7 @@ const normalizeProductData = async (item) => {
   return item;
 };
 
-excelController.post("/upload", upload.single("file"), async (req, res) => {
+excelController.post("/upload-or-update", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
       return sendResponse(res, 400, "Failed", {
@@ -112,7 +145,7 @@ excelController.post("/upload", upload.single("file"), async (req, res) => {
     const sheetName = workbook.SheetNames[0];
     const jsonData = xlsx.utils.sheet_to_json(workbook.Sheets[sheetName]);
 
-    fs.unlinkSync(filePath); // Clean up
+    fs.unlinkSync(filePath); // Clean up temp file
 
     if (!jsonData || jsonData.length === 0) {
       return sendResponse(res, 422, "Failed", {
@@ -121,93 +154,119 @@ excelController.post("/upload", upload.single("file"), async (req, res) => {
       });
     }
 
-    const processedData = await Promise.all(
-      jsonData
-        .filter(item => item.name && item.price)
-        .map(async (item) => {
-          // Check duplicate
-          const existingProduct = await Product.findOne({ name: item.name.trim() });
-          if (existingProduct) {
-            const error = new Error(`Duplicate product name "${item.name}" found. Upload aborted.`);
-            error.statusCode = 409; // Conflict
-            throw error;
-          }
-    
-          return normalizeProductData(item);
-        })
-    );
-    
-    
+    let insertedProducts = [];
+    let updatedProducts = [];
 
-    // Insert into Product collection
-    const insertedProducts = await Product.insertMany(processedData);
+    for (const item of jsonData.filter(i => i.name && i.price)) {
+      // Normalize data
+      const normalizedItem = await normalizeProductData({ ...item });
+
+      // Check if product exists by name
+      const existingProduct = await Product.findOne({ name: item.name.trim() });
+
+      if (existingProduct) {
+        // Update product
+        await Product.updateOne(
+          { _id: existingProduct._id },
+          { $set: normalizedItem }
+        );
+        updatedProducts.push(existingProduct.name);
+      } else {
+        // Insert new product
+        const newProduct = await Product.create(normalizedItem);
+        insertedProducts.push(newProduct.name);
+      }
+    }
+
+    // Dynamic message
+    let message = "";
+    if (insertedProducts.length > 0 && updatedProducts.length > 0) {
+      message = "Products uploaded and updated successfully!";
+    } else if (insertedProducts.length > 0) {
+      message = "Products uploaded successfully!";
+    } else if (updatedProducts.length > 0) {
+      message = "Products updated successfully!";
+    } else {
+      message = "No products were uploaded or updated.";
+    }
 
     return sendResponse(res, 200, "Success", {
-      message: "Excel data uploaded and saved successfully!",
-      data: insertedProducts,
+      message,
+      insertedCount: insertedProducts.length,
+      inserted: insertedProducts,
+      updatedCount: updatedProducts.length,
+      updated: updatedProducts,
       statusCode: 200,
     });
 
   } catch (error) {
-    console.error("Excel Upload Error:", error);
+    console.error("Excel Upload/Update Error:", error);
     const statusCode = error.statusCode || 500;
     return sendResponse(res, statusCode, "Failed", {
       message: error.message || "Internal Server Error",
       statusCode,
     });
   }
-  
 });
+
+
 
 
 excelController.post("/export", async (req, res) => {
   try {
     const { format = "excel" } = req.body;
 
-    // Fetch all products with populated category and brand names if needed
+    // Fetch products & populate category and brand
     const products = await Product.find()
       .populate("categoryId", "name")
       .populate("brandId", "name")
       .lean();
 
-      const processedProducts = products.map((p) => ({
-        ...p,
-        category: p.categoryId?.map(c => c.name).join(", ") || "",
-        brand: p.brandId?.name || "",
-        tags: Array.isArray(p.tags) ? p.tags.join(", ") : "",
-        specialAppearance: Array.isArray(p.specialAppearance) ? p.specialAppearance.join(", ") : "",
-      }));
-      
+    // Map to match upload template format
+    const processedProducts = products.map((p) => ({
+      name: p.name || "",
+      tags: Array.isArray(p.tags) ? p.tags.join(", ") : "",
+      category: Array.isArray(p.categoryId) ? p.categoryId.map(c => c.name).join(", ") : "",
+      brand: p.brandId?.name || "",
+      specialAppearance: Array.isArray(p.specialAppearance) ? p.specialAppearance.join(", ") : "",
+      shortDescription: p.shortDescription || "",
+      stockQuantity: p.stockQuantity || 0,
+      price: p.price || 0,
+      discountedPrice: p.discountedPrice || 0,
+      numberOfPieces: p.numberOfPieces || "",
+      soundLevel: p.soundLevel || "",
+      lightEffect: p.lightEffect || "",
+      safetyRating: p.safetyRating || "",
+      usageArea: p.usageArea || "",
+      duration: p.duration || "",
+      weightPerBox: p.weightPerBox || "",
+      productHeroImage: p.productHeroImage || "",
+      productGallery: Array.isArray(p.productGallery) ? p.productGallery.join(", ") : "",
+      status: p.status ? "True" : "False",
+    }));
 
     let fileBuffer;
     let contentType;
     let fileExtension;
 
     if (format === "excel") {
-      // Convert to Excel file
       const workbook = xlsx.utils.book_new();
-      const worksheet = xlsx.utils.json_to_sheet(processedProducts);
+      const worksheet = xlsx.utils.json_to_sheet(processedProducts, { header: Object.keys(processedProducts[0] || {}) });
       xlsx.utils.book_append_sheet(workbook, worksheet, "Products");
-
       fileBuffer = xlsx.write(workbook, { type: "buffer", bookType: "xlsx" });
       contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
       fileExtension = "xlsx";
-
     } else if (format === "csv") {
-      // Convert to CSV
       const worksheet = xlsx.utils.json_to_sheet(processedProducts);
       fileBuffer = Buffer.from(xlsx.utils.sheet_to_csv(worksheet), "utf-8");
       contentType = "text/csv";
       fileExtension = "csv";
-
     } else if (format === "txt") {
-      // Convert to TXT (tab separated)
       const worksheet = xlsx.utils.json_to_sheet(processedProducts);
       const txtData = xlsx.utils.sheet_to_txt(worksheet, { FS: "\t" });
       fileBuffer = Buffer.from(txtData, "utf-8");
       contentType = "text/plain";
       fileExtension = "txt";
-
     } else {
       return sendResponse(res, 400, "Failed", {
         message: "Invalid export format",
@@ -215,15 +274,89 @@ excelController.post("/export", async (req, res) => {
       });
     }
 
-    // Set headers for download
+    // Send file
     res.setHeader("Content-Type", contentType);
-    res.setHeader("Content-Disposition", `attachment; filename=productList.${fileExtension}`);
-
-    // Send the file buffer
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=BulkProductUploadTemplate.${fileExtension}`
+    );
     res.send(fileBuffer);
 
   } catch (error) {
     console.error("Export Error:", error);
+    return sendResponse(res, 500, "Failed", {
+      message: error.message || "Internal Server Error",
+      statusCode: 500,
+    });
+  }
+});
+
+
+excelController.get("/sample", async (req, res) => {
+  try {
+    const format = (req.query.format || "excel").toLowerCase();
+
+    // Headers as per BulkProductUploadTemplate.xlsx
+    const headers = [
+      "name",
+      "tags",
+      "category",
+      "brand",
+      "specialAppearance",
+      "shortDescription",
+      "stockQuantity",
+      "price",
+      "discountedPrice",
+      "numberOfPieces",
+      "soundLevel",
+      "lightEffect",
+      "safetyRating",
+      "usageArea",
+      "duration",
+      "weightPerBox",
+      "productHeroImage",
+      "productGallery",
+      "status"
+    ];
+
+    // Create a blank worksheet with just headers
+    const ws = xlsx.utils.aoa_to_sheet([headers]);
+    const wb = xlsx.utils.book_new();
+    xlsx.utils.book_append_sheet(wb, ws, "Sample");
+
+    let fileBuffer;
+    let contentType;
+    let fileExtension;
+
+    if (format === "excel") {
+      fileBuffer = xlsx.write(wb, { type: "buffer", bookType: "xlsx" });
+      contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+      fileExtension = "xlsx";
+    } 
+    else if (format === "csv") {
+      fileBuffer = Buffer.from(xlsx.utils.sheet_to_csv(ws), "utf-8");
+      contentType = "text/csv";
+      fileExtension = "csv";
+    } 
+    else if (format === "txt") {
+      const txtData = xlsx.utils.sheet_to_txt(ws, { FS: "\t" });
+      fileBuffer = Buffer.from(txtData, "utf-8");
+      contentType = "text/plain";
+      fileExtension = "txt";
+    } 
+    else {
+      return sendResponse(res, 400, "Failed", {
+        message: "Invalid format. Use excel, csv, or txt.",
+        statusCode: 400,
+      });
+    }
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Disposition", `attachment; filename=BulkProductUploadTemplate.${fileExtension}`);
+    res.send(fileBuffer);
+
+  } catch (error) {
+    console.error("Sample File Download Error:", error);
     return sendResponse(res, 500, "Failed", {
       message: error.message || "Internal Server Error",
       statusCode: 500,
