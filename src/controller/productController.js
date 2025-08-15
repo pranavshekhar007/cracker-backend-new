@@ -757,5 +757,33 @@ productController.get("/by-category/:categoryId", async (req, res) => {
   }
 });
 
+productController.post("/bulk-delete", async (req, res) => {
+  try {
+    const { ids } = req.body;
+
+    // Validation
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return sendResponse(res, 400, "Failed", {
+        message: "Please provide an array of product IDs to delete",
+        statusCode: 400,
+      });
+    }
+
+    // Delete products
+    const deleteResult = await Product.deleteMany({ _id: { $in: ids } });
+
+    sendResponse(res, 200, "Success", {
+      message: `${deleteResult.deletedCount} products deleted successfully`,
+      deletedCount: deleteResult.deletedCount,
+      statusCode: 200,
+    });
+  } catch (error) {
+    console.error("Bulk delete error:", error);
+    sendResponse(res, 500, "Failed", {
+      message: error.message || "Internal server error",
+      statusCode: 500,
+    });
+  }
+});
 
 module.exports = productController;
