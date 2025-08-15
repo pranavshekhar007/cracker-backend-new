@@ -15,6 +15,8 @@ const Brand = require("../model/brand.Schema");
 const excelController = express.Router();
 
 const uploadLocalImage = async (filePath, folder) => {
+  console.log("file path: ", filePath);
+  console.log("Folder", folder);
   try {
     // Ensure path is valid for server
     if (!fs.existsSync(filePath)) {
@@ -25,14 +27,21 @@ const uploadLocalImage = async (filePath, folder) => {
     // Read file as base64
     const fileData = fs.readFileSync(filePath, { encoding: "base64" });
 
+    console.log("File Data", fileData);
+
     // Guess extension (default jpeg if unknown)
     const ext = path.extname(filePath).replace(".", "") || "jpeg";
+
+    console.log("extension:", ext);
 
     // Convert to Data URI
     const dataURI = `data:image/${ext};base64,${fileData}`;
 
+    console.log("data", dataURI);
+
     // Upload to Cloudinary
     const uploadRes = await cloudinary.uploader.upload(dataURI, { folder });
+    console.log("upload",uploadRes);
     return uploadRes.secure_url;
   } catch (err) {
     console.error(`Image upload error for ${filePath}:`, err);
